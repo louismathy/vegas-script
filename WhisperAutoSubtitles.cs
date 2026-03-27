@@ -29,7 +29,7 @@ public class EntryPoint
             Directory.CreateDirectory(tempOutputDir);
 
             string jsonPath = RunWhisperWithProgress(config, tempOutputDir);
-            var captions = ParseWhisperJson(jsonPath, 4);
+            var captions = ParseWhisperJson(jsonPath, config.SplitText ? config.WordsPerCaption : 0);
             if (captions.Count == 0)
             {
                 throw new ApplicationException("Whisper finished, but no subtitle entries were found in the output.");
@@ -66,6 +66,10 @@ public class EntryPoint
         public Color TextColor;
         public Color OutlineColor;
         public int OutlineWidth;
+        public bool SplitText;
+        public int WordsPerCaption;
+        public bool UseLineBreaks;
+        public int WordsPerLine;
     }
 
     private class Caption
@@ -122,6 +126,69 @@ public class EntryPoint
             return null;
         }
 
+        // Ask about text splitting mode
+        string splitModeInput = Prompt(
+            "Text Split Mode",
+            "yes",
+            "Split text into short captions?\n\n" +
+            "• yes - Split into smaller chunks (default: 4 words each)\n" +
+            "• no - Keep original sentence/segment timing\n" +
+            "• [number] - Split with custom words per caption (e.g., 3, 5, 6)"
+        );
+        if (splitModeInput == null)
+        {
+            return null;
+        }
+
+        bool splitText = true;
+        int wordsPerCaption = 4;
+        splitModeInput = splitModeInput.Trim().ToLowerInvariant();
+        
+        if (splitModeInput == "no" || splitModeInput == "n" || splitModeInput == "false")
+        {
+            splitText = false;
+        }
+        else if (splitModeInput != "yes" && splitModeInput != "y" && splitModeInput != "true")
+        {
+            int parsed;
+            if (int.TryParse(splitModeInput, out parsed) && parsed > 0)
+            {
+                wordsPerCaption = parsed;
+            }
+        }
+
+        // Ask about line breaks within captions
+        string lineBreakInput = Prompt(
+            "Line Breaks",
+            "no",
+            "Add line breaks within captions?\n\n" +
+            "• no - No line breaks (single line captions)\n" +
+            "• yes - Add line breaks (default: every 4 words)\n" +
+            "• [number] - Add line break after X words (e.g., 3, 5, 6)"
+        );
+        if (lineBreakInput == null)
+        {
+            return null;
+        }
+
+        bool useLineBreaks = false;
+        int wordsPerLine = 4;
+        lineBreakInput = lineBreakInput.Trim().ToLowerInvariant();
+        
+        if (lineBreakInput == "yes" || lineBreakInput == "y" || lineBreakInput == "true")
+        {
+            useLineBreaks = true;
+        }
+        else if (lineBreakInput != "no" && lineBreakInput != "n" && lineBreakInput != "false")
+        {
+            int parsed;
+            if (int.TryParse(lineBreakInput, out parsed) && parsed > 0)
+            {
+                useLineBreaks = true;
+                wordsPerLine = parsed;
+            }
+        }
+
         // Show style settings dialog with preview
         SubtitleStyleSettings styleSettings = ShowStyleDialog();
         if (styleSettings == null)
@@ -139,7 +206,11 @@ public class EntryPoint
             FontSize = styleSettings.FontSize,
             TextColor = styleSettings.TextColor,
             OutlineColor = styleSettings.OutlineColor,
-            OutlineWidth = styleSettings.OutlineWidth
+            OutlineWidth = styleSettings.OutlineWidth,
+            SplitText = splitText,
+            WordsPerCaption = wordsPerCaption,
+            UseLineBreaks = useLineBreaks,
+            WordsPerLine = wordsPerLine
         };
     }
 
@@ -790,6 +861,13 @@ public class EntryPoint
     private static List<Caption> ParseWhisperJson(string path, int wordsPerCaption)
     {
         string json = File.ReadAllText(path, Encoding.UTF8);
+        
+        // If wordsPerCaption is 0 or less, parse segment-level captions (no splitting)
+        if (wordsPerCaption <= 0)
+        {
+            return ParseWhisperJsonSegments(json);
+        }
+        
         List<WordInfo> allWords = new List<WordInfo>();
 
         // Parse segments array from Whisper JSON
@@ -856,6 +934,45 @@ public class EntryPoint
             });
         }
 
+        return captions;
+    }
+
+    private static List<Caption> ParseWhisperJsonSegments(string json)
+    {
+        List<Caption> captions = new List<Caption>();
+        
+        // Parse segments array from Whisper JSON
+        // Format: {"segments": [{"start": 0.0, "end": 2.5, "text": "Hello world", ...}, ...]}
+        MatchCollection segmentMatches = Regex.Matches(json, 
+            @"\{\s*[^{}]*""start""\s*:\s*([\d.]+)\s*,\s*""end""\s*:\s*([\d.]+)\s*,\s*""text""\s*:\s*""([^""]*)""",
+            RegexOptions.Singleline);
+        
+        foreach (Match match in segmentMatches)
+        {
+            double start, end;
+            
+            if (double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out start) &&
+                double.TryParse(match.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out end))
+            {
+                string text = DecodeJsonUnicode(match.Groups[3].Value).Trim();
+                
+                if (!string.IsNullOrEmpty(text))
+                {
+                    if (end <= start)
+                    {
+                        end = start + 0.5;
+                    }
+                    
+                    captions.Add(new Caption
+                    {
+                        Start = TimeSpan.FromSeconds(start),
+                        End = TimeSpan.FromSeconds(end),
+                        Text = text
+                    });
+                }
+            }
+        }
+        
         return captions;
     }
 
@@ -1028,12 +1145,51 @@ public class EntryPoint
                     throw new ApplicationException("Generated text media has no video stream.");
                 }
 
-                TrySetGeneratedText(media, caption.Text, config);
+                string displayText = caption.Text;
+                if (config.UseLineBreaks)
+                {
+                    displayText = InsertLineBreaks(caption.Text, config.WordsPerLine);
+                }
+
+                TrySetGeneratedText(media, displayText, config);
 
                 VideoEvent ev = subtitleTrack.AddVideoEvent(start, length);
                 ev.Takes.Add(new Take(stream));
             }
         }
+    }
+
+    private static string InsertLineBreaks(string text, int wordsPerLine)
+    {
+        if (string.IsNullOrWhiteSpace(text) || wordsPerLine < 1)
+        {
+            return text;
+        }
+
+        string[] words = text.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length <= wordsPerLine)
+        {
+            return text;
+        }
+
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < words.Length; i++)
+        {
+            if (i > 0)
+            {
+                if (i % wordsPerLine == 0)
+                {
+                    result.Append("\r\n");
+                }
+                else
+                {
+                    result.Append(" ");
+                }
+            }
+            result.Append(words[i]);
+        }
+
+        return result.ToString();
     }
 
     private static PlugInNode FindTextGenerator(Vegas vegas)
